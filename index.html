@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Void Warden Boss Battle</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #0a0a0c; color: white; font-family: sans-serif; }
+        canvas { display: block; background: #15151e; }
+        #ui { position: absolute; top: 20px; left: 20px; right: 20px; pointer-events: none; }
+        .bar-container { width: 100%; height: 12px; background: #333; border: 2px solid #555; border-radius: 6px; overflow: hidden; margin-bottom: 8px; }
+        #boss-hp { width: 100%; height: 100%; background: linear-gradient(90deg, #ff0055, #aa0033); transition: width 0.3s; }
+        #player-hp { width: 100%; height: 100%; background: linear-gradient(90deg, #00ff88, #00aa66); transition: width 0.3s; }
+        .label { font-size: 14px; font-weight: bold; text-transform: uppercase; margin-bottom: 4px; display: flex; justify-content: space-between; }
+        #msg-overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(0,0,0,0.85); visibility: hidden; pointer-events: auto; z-index: 100; }
+        .btn { padding: 12px 24px; background: #ff0055; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-top: 20px; }
+        .controls-hint { position: absolute; bottom: 20px; left: 20px; color: #888; font-size: 12px; }
+        .skill-slots { display: flex; gap: 10px; margin-top: 10px; }
+        .skill { width: 45px; height: 45px; background: rgba(255,255,255,0.05); border: 1px solid #444; border-radius: 4px; display: flex; flex-direction: column; align-items: center; justify-content: center; font-size: 9px; position: relative; overflow: hidden; }
+        .skill-cd { position: absolute; bottom: 0; left: 0; width: 100%; background: rgba(0,255,136,0.3); height: 0%; transition: height 0.1s; }
+        .skill-key { font-weight: bold; color: #aaa; margin-top: 2px; }
+        
+        /* 音樂提示 UI */
+        #audio-prompt {
+            position: absolute; bottom: 60px; left: 20px; background: rgba(0,0,0,0.7);
+            padding: 8px 12px; border-radius: 4px; border-left: 4px solid #00ff88;
+            font-size: 12px; transition: opacity 0.5s;
+        }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <div>
+        <div class="label"><span>虛空守望者 - 阿爾法</span><span id="boss-phase-text">PHASE 1</span></div>
+        <div class="bar-container"><div id="boss-hp"></div></div>
+    </div>
+    <div style="width: 250px; margin-top: 20px;">
+        <div class="label"><span>英雄 (Hero)</span></div>
+        <div class="bar-container"><div id="player-hp"></div></div>
+        <div class="skill-slots">
+            <div class="skill">揮劍<span class="skill-key">J</span><div id="cd-attack" class="skill-cd"></div></div>
+            <div class="skill">遠射<span class="skill-key">I</span><div id="cd-shoot" class="skill-cd"></div></div>
+            <div class="skill">衝刺<span class="skill-key">K</span><div id="cd-dash" class="skill-cd"></div></div>
+        </div>
+    </div>
+</div>
+
+<div id="audio-prompt">點擊畫面任何地方以開啟背景音樂</div>
+
+<div id="msg-overlay">
+    <h1 id="msg-title" class="text-6xl font-black mb-4">遊戲結束</h1>
+    <p id="msg-desc" class="text-xl">阿爾法守住了虛空...</p>
+    <button class="btn" onclick="resetGame()">再次挑戰</button>
+</div>
+
+<div class="controls-hint">
+    [A/D] 移動 | [W] 跳躍 | [J / 左鍵] 近戰 | [I / 右鍵] 遠程 | [K / Shift] 衝刺
+</div>
+
+<canvas id="gameCanvas"></canvas>
+
+<script>
+/**
+ * 背景音樂音效系統
+ */
+const bgm = new Audio();
+// 使用 encodeURIComponent 處理檔名中的中文、空格與括號問題
+bgm.src = encodeURIComponent("輕快的一天 (3).mp3");
+bgm.loop = true; // 開啟循環播放
+bgm.volume = 0.5; // 設定音量 (0.0 到 1.0)
+
+let audioStarted = false;
+
+// 啟動音樂的函數 (處理瀏覽器自動播放限制)
+function startAudio() {
+    if (audioStarted) return;
+    bgm.play().then(() => {
+        audioStarted = true;
+        document.getElementById('audio-prompt').style.opacity = '0';
+        setTimeout(() => document.getElementById('audio-prompt').remove(), 500);
+    }).catch(err => {
+        console.log("播放被阻擋，等待使用者互動:", err);
+    });
+}
+
+// 監聽第一次使用者互動來啟動音樂
+window.addEventListener('mousedown', startAudio);
+window.addEventListener('keydown', startAudio);
+
+/**
+ * 遊戲邏輯與設定 (保留原有邏輯)
+ */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const msgOverlay = document.getElementById('msg-overlay');
+const msgTitle = document.getElementById('msg-title');
+const bossHpBar = document.getElementById('boss-hp');
+const playerHpBar = document.getElementById('player-hp');
+const bossPhaseText = document.getElementById('boss-phase-text');
+
+const cdAttackUI = document.getElementById('cd-attack');
+const cdShootUI = document.getElementById('cd-shoot');
+const cdDashUI = document.getElementById('cd-dash');
+
+let width, height;
+let particles = [];
+let gameActive = true;
+let screenShake = 0;
+let hitstopFrames = 0;
+
+const CONFIG = {
+    gravity: 0.6,
+    friction: 0.8,
+    playerSpeed: 6.5,
+    playerJump: 14,
+    playerDashForce: 16,
+    bossBaseSpeed: 2,
+    attackCD: 20,
+    shootCD: 35,
+    dashCD: 50
+};
+
+const player = {
+    x: 100, y: 0, w: 32, h: 50,
+    vx: 0, vy: 0,
+    hp: 100, maxHp: 100,
+    grounded: false,
+    jumpCount: 0,
+    dashCooldown: 0,
+    isDashing: 0,
+    attackCooldown: 0,
+    isAttacking: 0,
+    shootCooldown: 0,
+    facing: 1, 
+    invul: 0,
+    ghosts: [],
+    projectiles: [] 
+};
+
+const boss = {
+    x: 0, y: 0, w: 100, h: 150,
+    vx: 0, vy: 0,
+    hp: 1000, maxHp: 1000,
+    phase: 1,
+    state: 'IDLE', 
+    stateTimer: 0,
+    attackType: '',
+    facing: -1,
+    bullets: []
+};
+
+const platforms = [
+    { x: 0, y: 0, w: 0, h: 60, type: 'floor' }, 
+    { x: 200, y: 500, w: 200, h: 20 },
+    { x: 850, y: 500, w: 200, h: 20 },
+    { x: 525, y: 350, w: 250, h: 20 }
+];
+
+const keys = {};
+
+function resize() {
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = width;
+    canvas.height = height;
+    platforms[0].w = width;
+    platforms[0].y = height - 100;
+}
+
+function spawnParticles(x, y, color, count = 10, speed = 8) {
+    for(let i=0; i<count; i++) {
+        particles.push({
+            x, y,
+            vx: (Math.random() - 0.5) * speed,
+            vy: (Math.random() - 0.5) * speed,
+            life: 1,
+            color,
+            size: Math.random() * 4 + 2
+        });
+    }
+}
+
+function update() {
+    if (!gameActive) return;
+
+    if (hitstopFrames > 0) {
+        hitstopFrames--;
+        draw();
+        requestAnimationFrame(update);
+        return;
+    }
+
+    if (player.invul > 0) player.invul--;
+    
+    if (player.dashCooldown > 0) {
+        player.dashCooldown--;
+        cdDashUI.style.height = (player.dashCooldown / CONFIG.dashCD * 100) + '%';
+    } else cdDashUI.style.height = '0%';
+    
+    if (player.attackCooldown > 0) {
+        player.attackCooldown--;
+        cdAttackUI.style.height = (player.attackCooldown / CONFIG.attackCD * 100) + '%';
+    } else cdAttackUI.style.height = '0%';
+
+    if (player.shootCooldown > 0) {
+        player.shootCooldown--;
+        cdShootUI.style.height = (player.shootCooldown / CONFIG.shootCD * 100) + '%';
+    } else cdShootUI.style.height = '0%';
+
+    if (player.isDashing > 0) {
+        player.isDashing--;
+        if (player.isDashing % 3 === 0) {
+            player.ghosts.push({x: player.x, y: player.y, life: 0.5});
+        }
+    }
+    if (player.isAttacking > 0) player.isAttacking--;
+
+    if (player.isDashing === 0) {
+        if (keys['a'] || keys['arrowleft']) { player.vx = -CONFIG.playerSpeed; player.facing = -1; }
+        else if (keys['d'] || keys['arrowright']) { player.vx = CONFIG.playerSpeed; player.facing = 1; }
+        else { player.vx *= CONFIG.friction; }
+    }
+
+    player.vy += CONFIG.gravity;
+    player.x += player.vx;
+    player.y += player.vy;
+
+    player.grounded = false;
+    platforms.forEach(p => {
+        if (player.x + player.w > p.x && player.x < p.x + p.w &&
+            player.y + player.h > p.y && player.y + player.h < p.y + p.h + player.vy) {
+            player.y = p.y - player.h;
+            player.vy = 0;
+            player.grounded = true;
+            player.jumpCount = 0;
+        }
+    });
+
+    if (player.x < 0) player.x = 0;
+    if (player.x + player.w > width) player.x = width - player.w;
+
+    player.projectiles.forEach((p, index) => {
+        p.x += p.vx;
+        if (p.x + 10 > boss.x && p.x - 10 < boss.x + boss.w &&
+            p.y + 10 > boss.y && p.y - 10 < boss.y + boss.h) {
+            damageBoss(15);
+            spawnParticles(p.x, p.y, '#00ff88', 5, 4);
+            player.projectiles.splice(index, 1);
+        }
+        if (p.x < 0 || p.x > width) player.projectiles.splice(index, 1);
+    });
+
+    updateBossAI();
+
+    if (player.isAttacking > 0 && player.isAttacking === 8) {
+        let hitrange = 100;
+        let attackX = player.facing === 1 ? player.x + player.w : player.x - hitrange;
+        if (attackX + hitrange > boss.x && attackX < boss.x + boss.w &&
+            player.y + player.h > boss.y - 20 && player.y < boss.y + boss.h + 20) {
+            damageBoss(45);
+            hitstopFrames = 5;
+            screenShake = 12;
+        }
+    }
+
+    if (player.invul === 0 && player.isDashing === 0) {
+        if (player.x + player.w > boss.x && player.x < boss.x + boss.w &&
+            player.y + player.h > boss.y && player.y < boss.y + boss.h) {
+            damagePlayer(15);
+        }
+    }
+
+    boss.bullets.forEach((b, index) => {
+        b.x += b.vx; b.y += b.vy;
+        if (player.invul === 0 && player.isDashing === 0 && player.x + player.w > b.x - 10 && player.x < b.x + 10 &&
+            player.y + player.h > b.y - 10 && player.y < b.y + 10) {
+            damagePlayer(12);
+            boss.bullets.splice(index, 1);
+        }
+        if (b.x < -100 || b.x > width + 100 || b.y < -100 || b.y > height + 100) boss.bullets.splice(index, 1);
+    });
+
+    player.ghosts.forEach((g, i) => {
+        g.life -= 0.05;
+        if (g.life <= 0) player.ghosts.splice(i, 1);
+    });
+
+    particles.forEach((p, i) => {
+        p.x += p.vx; p.y += p.vy; p.life -= 0.02;
+        if (p.life <= 0) particles.splice(i, 1);
+    });
+
+    if (screenShake > 0) screenShake *= 0.9;
+    draw();
+    requestAnimationFrame(update);
+}
+
+function updateBossAI() {
+    boss.stateTimer--;
+    const hpRatio = boss.hp / boss.maxHp;
+    if (hpRatio < 0.3) { boss.phase = 3; bossPhaseText.innerText = "FINAL PHASE: RAGE"; }
+    else if (hpRatio < 0.7) { boss.phase = 2; bossPhaseText.innerText = "PHASE 2: PROJECTILES"; }
+
+    if (boss.state === 'IDLE') {
+        const dx = (player.x + player.w/2) - (boss.x + boss.w/2);
+        boss.facing = dx > 0 ? 1 : -1;
+        boss.vx = dx > 0 ? CONFIG.bossBaseSpeed : -CONFIG.bossBaseSpeed;
+        if (boss.stateTimer <= 0) decideNextAttack();
+    } else if (boss.state === 'PREP') {
+        boss.vx *= 0.8;
+        if (boss.stateTimer <= 0) executeAttack();
+    } else if (boss.state === 'ATTACK') {
+        if (boss.attackType === 'DASH_STRIKE') boss.x += boss.vx;
+        if (boss.stateTimer <= 0) {
+            if (boss.attackType === 'SLAM') {
+                if (player.grounded && Math.abs((player.x + player.w/2) - (boss.x + boss.w/2)) < 380) {
+                    damagePlayer(25);
+                }
+                screenShake = 15;
+                spawnParticles(boss.x + boss.w/2, platforms[0].y, '#ff0055', 40, 12);
+            }
+            boss.state = 'COOLDOWN';
+            boss.stateTimer = 50;
+        }
+    } else if (boss.state === 'COOLDOWN') {
+        boss.vx = 0;
+        if (boss.stateTimer <= 0) {
+            boss.state = 'IDLE';
+            boss.stateTimer = 40 - (boss.phase * 5);
+        }
+    }
+
+    if (boss.state !== 'ATTACK' || boss.attackType !== 'DASH_STRIKE') boss.x += boss.vx;
+    boss.y = platforms[0].y - boss.h;
+    if (boss.x < 0) boss.x = 0;
+    if (boss.x + boss.w > width) boss.x = width - boss.w;
+}
+
+function decideNextAttack() {
+    const r = Math.random();
+    boss.state = 'PREP';
+    boss.stateTimer = 45 - (boss.phase * 5);
+    if (boss.phase === 1) boss.attackType = 'SLAM';
+    else if (boss.phase === 2) boss.attackType = r > 0.4 ? 'SLAM' : 'BURST';
+    else boss.attackType = r > 0.6 ? 'SLAM' : (r > 0.3 ? 'BURST' : 'DASH_STRIKE');
+}
+
+function executeAttack() {
+    boss.state = 'ATTACK';
+    switch(boss.attackType) {
+        case 'SLAM': boss.stateTimer = 5; break;
+        case 'BURST':
+            for(let i=0; i<12; i++) {
+                const angle = (Math.PI * 2 / 12) * i;
+                boss.bullets.push({
+                    x: boss.x + boss.w/2, y: boss.y + boss.h/2,
+                    vx: Math.cos(angle) * 6, vy: Math.sin(angle) * 6
+                });
+            }
+            boss.state = 'COOLDOWN'; boss.stateTimer = 30;
+            break;
+        case 'DASH_STRIKE':
+            boss.vx = boss.facing * 24; boss.stateTimer = 25;
+            break;
+    }
+}
+
+function damagePlayer(amt) {
+    if (player.invul > 0 || player.isDashing > 0 || !gameActive) return;
+    player.hp -= amt;
+    player.invul = 60;
+    screenShake = 20;
+    spawnParticles(player.x + player.w/2, player.y + player.h/2, '#00ff88', 20);
+    playerHpBar.style.width = Math.max(0, player.hp) + '%';
+    if (player.hp <= 0) gameOver(false);
+}
+
+function damageBoss(amt) {
+    if (!gameActive) return;
+    boss.hp -= amt;
+    spawnParticles(boss.x + boss.w/2, boss.y + boss.h/2, '#ffffff', 8);
+    bossHpBar.style.width = (boss.hp / boss.maxHp * 100) + '%';
+    if (boss.hp <= 0) gameOver(true);
+}
+
+function gameOver(win) {
+    gameActive = false;
+    msgOverlay.style.visibility = 'visible';
+    msgTitle.innerText = win ? "勝利！擊敗了守望者" : "任務失敗";
+    msgTitle.style.color = win ? "#00ff88" : "#ff0055";
+    msgDesc.innerText = win ? "你證明了你是這片虛空的最強者。" : "你的靈魂成為了虛空的養料...";
+}
+
+function resetGame() {
+    player.hp = 100; player.x = 100; player.y = 0; player.vx = 0; player.vy = 0;
+    player.projectiles = [];
+    boss.hp = 1000; boss.phase = 1; boss.state = 'IDLE'; boss.bullets = [];
+    gameActive = true;
+    msgOverlay.style.visibility = 'hidden';
+    playerHpBar.style.width = '100%';
+    bossHpBar.style.width = '100%';
+    bossPhaseText.innerText = "PHASE 1";
+    update();
+}
+
+function draw() {
+    ctx.save();
+    if (screenShake > 0.5) ctx.translate((Math.random()-0.5)*screenShake, (Math.random()-0.5)*screenShake);
+    ctx.clearRect(0, 0, width, height);
+
+    ctx.fillStyle = '#1c1c28';
+    platforms.forEach(p => {
+        ctx.fillRect(p.x, p.y, p.w, p.h);
+        ctx.fillStyle = '#2d2d3d'; ctx.fillRect(p.x, p.y, p.w, 4);
+    });
+
+    particles.forEach(p => {
+        ctx.globalAlpha = p.life; ctx.fillStyle = p.color;
+        ctx.fillRect(p.x, p.y, p.size, p.size);
+    });
+    ctx.globalAlpha = 1;
+
+    player.projectiles.forEach(p => {
+        ctx.fillStyle = '#00ff88';
+        ctx.shadowBlur = 15; ctx.shadowColor = '#00ff88';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 8, 0, Math.PI*2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+    });
+
+    ctx.fillStyle = '#00f2ff';
+    ctx.shadowBlur = 10; ctx.shadowColor = '#00f2ff';
+    boss.bullets.forEach(b => {
+        ctx.beginPath(); ctx.arc(b.x, b.y, 7, 0, Math.PI*2); ctx.fill();
+    });
+    ctx.shadowBlur = 0;
+
+    player.ghosts.forEach(g => {
+        ctx.globalAlpha = g.life; ctx.fillStyle = '#00ff88';
+        ctx.fillRect(g.x, g.y, player.w, player.h);
+    });
+    ctx.globalAlpha = 1;
+
+    if (player.invul % 6 < 3) {
+        ctx.fillStyle = '#00ff88';
+        ctx.shadowBlur = 15; ctx.shadowColor = '#00ff88';
+        ctx.fillRect(player.x, player.y, player.w, player.h);
+        ctx.shadowBlur = 0;
+
+        ctx.fillStyle = 'white';
+        const eyeX = player.facing === 1 ? player.x + 18 : player.x + 6;
+        ctx.fillRect(eyeX, player.y + 12, 8, 8);
+        
+        ctx.fillStyle = '#008844';
+        const capeX = player.facing === 1 ? player.x : player.x + player.w - 10;
+        ctx.fillRect(capeX - (player.vx), player.y + 15, 10, 30);
+
+        if (player.isAttacking > 0) {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.beginPath();
+            if (player.facing === 1) ctx.arc(player.x + player.w, player.y + player.h/2, 70, -Math.PI/2, Math.PI/2);
+            else ctx.arc(player.x, player.y + player.h/2, 70, Math.PI/2, Math.PI * 1.5);
+            ctx.fill();
+        }
+    }
+
+    if (boss.state === 'PREP') {
+        ctx.strokeStyle = 'white'; ctx.lineWidth = 3;
+        ctx.strokeRect(boss.x - 5, boss.y - 5, boss.w + 10, boss.h + 10);
+        ctx.fillStyle = '#ffaa00';
+    } else if (boss.state === 'COOLDOWN') ctx.fillStyle = '#440022';
+    else ctx.fillStyle = '#ff0055';
+    ctx.fillRect(boss.x, boss.y, boss.w, boss.h);
+    
+    ctx.fillStyle = 'white';
+    const bEyeX = boss.facing === 1 ? boss.x + boss.w - 30 : boss.x + 15;
+    ctx.fillRect(bEyeX, boss.y + 35, 20, 20);
+
+    if (boss.state === 'PREP' && boss.attackType === 'SLAM') {
+        ctx.fillStyle = 'rgba(255, 0, 85, 0.3)';
+        ctx.fillRect(boss.x + boss.w/2 - 190, platforms[0].y - 15, 380, 15);
+    }
+    ctx.restore();
+}
+
+window.addEventListener('keydown', e => {
+    const k = e.key.toLowerCase();
+    keys[k] = true;
+    if (k === ' ' || k === 'w') {
+        if (player.jumpCount < 2) {
+            player.vy = -CONFIG.playerJump;
+            player.jumpCount++;
+            spawnParticles(player.x + player.w/2, player.y + player.h, '#fff', 8, 4);
+        }
+    }
+    if (k === 'k' || e.shiftKey) {
+        if (player.dashCooldown === 0) {
+            player.isDashing = 12;
+            player.dashCooldown = CONFIG.dashCD;
+            player.vx = player.facing * CONFIG.playerDashForce;
+            player.vy = 0;
+            screenShake = 5;
+        }
+    }
+    if (k === 'j') {
+        if (player.attackCooldown === 0) {
+            player.isAttacking = 10;
+            player.attackCooldown = CONFIG.attackCD;
+        }
+    }
+    if (k === 'i') {
+        playerShoot();
+    }
+});
+
+function playerShoot() {
+    if (player.shootCooldown === 0) {
+        player.projectiles.push({
+            x: player.x + player.w/2,
+            y: player.y + player.h/2,
+            vx: player.facing * 12
+        });
+        player.shootCooldown = CONFIG.shootCD;
+        spawnParticles(player.x + (player.facing * 30), player.y + player.h/2, '#00ff88', 5, 3);
+    }
+}
+
+window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+window.addEventListener('mousedown', (e) => {
+    if (e.button === 0 && player.attackCooldown === 0) {
+        player.isAttacking = 10;
+        player.attackCooldown = CONFIG.attackCD;
+    }
+    if (e.button === 2) { 
+        playerShoot();
+    }
+});
+
+window.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('resize', resize);
+resize();
+player.y = platforms[0].y - player.h;
+boss.x = width - 200;
+update();
+
+</script>
+</body>
+</html>
